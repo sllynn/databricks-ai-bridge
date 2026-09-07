@@ -11,6 +11,7 @@ from databricks_ai_bridge.genie import (
     Genie,
     GenieVizAttachment,
     _count_tokens,
+    _extract_follow_up_question_from_attachments,
     _extract_suggested_questions_from_attachment,
     _extract_text_attachment_content_from_attachments,
     _parse_attachments,
@@ -1082,6 +1083,35 @@ def test_extract_suggested_questions(attachment, expected):
 def test_extract_text_content(attachments, expected):
     """Test extracting and joining text content with various inputs."""
     assert _extract_text_attachment_content_from_attachments(attachments) == expected
+
+
+def test_text_attachment_purposes_keep_answers_and_clarifications_separate():
+    attachments = [
+        {
+            "text": {
+                "content": "The current answer is 42.",
+                "purpose": "TEXT_ATTACHMENT_PURPOSE_ANSWER",
+            }
+        },
+        {
+            "text": {
+                "content": "Which region should I use?",
+                "purpose": "FOLLOW_UP_QUESTION",
+            }
+        },
+    ]
+
+    assert _extract_text_attachment_content_from_attachments(attachments) == (
+        "The current answer is 42."
+    )
+    assert _extract_follow_up_question_from_attachments(attachments) == (
+        "Which region should I use?"
+    )
+
+
+@pytest.mark.parametrize("attachments", [None, [], "invalid", [{"text": {}}]])
+def test_missing_follow_up_question_returns_none(attachments):
+    assert _extract_follow_up_question_from_attachments(attachments) is None
 
 
 def test_poll_with_all_attachments(genie, mock_workspace_client):
