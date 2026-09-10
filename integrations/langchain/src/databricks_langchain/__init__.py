@@ -13,22 +13,60 @@ Available aliases:
 Refer to the Unity Catalog `documentation <https://docs.unitycatalog.io/ai/integrations/langchain/#using-unity-catalog-ai-with-langchain>`_ for more information.
 """
 
-from unitycatalog.ai.core.base import set_uc_function_client
-from unitycatalog.ai.core.databricks import DatabricksFunctionClient
-from unitycatalog.ai.langchain.toolkit import UCFunctionToolkit, UnityCatalogTool
+from importlib import import_module
+from typing import Any
 
-from databricks_langchain.chat_models import ChatDatabricks
-from databricks_langchain.checkpoint import AsyncCheckpointSaver, CheckpointSaver
-from databricks_langchain.embeddings import DatabricksEmbeddings
-from databricks_langchain.genie import GenieAgent
-from databricks_langchain.multi_server_mcp_client import (
-    DatabricksMCPServer,
-    DatabricksMultiServerMCPClient,
-    MCPServer,
-)
-from databricks_langchain.store import AsyncDatabricksStore, DatabricksStore
-from databricks_langchain.vector_search_retriever_tool import VectorSearchRetrieverTool
-from databricks_langchain.vectorstores import DatabricksVectorSearch
+_EXPORTS = {
+    "ChatDatabricks": ("databricks_langchain.chat_models", "ChatDatabricks"),
+    "AsyncCheckpointSaver": (
+        "databricks_langchain.checkpoint",
+        "AsyncCheckpointSaver",
+    ),
+    "CheckpointSaver": ("databricks_langchain.checkpoint", "CheckpointSaver"),
+    "DatabricksEmbeddings": (
+        "databricks_langchain.embeddings",
+        "DatabricksEmbeddings",
+    ),
+    "GenieAgent": ("databricks_langchain.genie", "GenieAgent"),
+    "DatabricksMCPServer": (
+        "databricks_langchain.multi_server_mcp_client",
+        "DatabricksMCPServer",
+    ),
+    "DatabricksMultiServerMCPClient": (
+        "databricks_langchain.multi_server_mcp_client",
+        "DatabricksMultiServerMCPClient",
+    ),
+    "MCPServer": ("databricks_langchain.multi_server_mcp_client", "MCPServer"),
+    "AsyncDatabricksStore": ("databricks_langchain.store", "AsyncDatabricksStore"),
+    "DatabricksStore": ("databricks_langchain.store", "DatabricksStore"),
+    "VectorSearchRetrieverTool": (
+        "databricks_langchain.vector_search_retriever_tool",
+        "VectorSearchRetrieverTool",
+    ),
+    "DatabricksVectorSearch": (
+        "databricks_langchain.vectorstores",
+        "DatabricksVectorSearch",
+    ),
+    "set_uc_function_client": ("unitycatalog.ai.core.base", "set_uc_function_client"),
+    "DatabricksFunctionClient": (
+        "unitycatalog.ai.core.databricks",
+        "DatabricksFunctionClient",
+    ),
+    "UCFunctionToolkit": ("unitycatalog.ai.langchain.toolkit", "UCFunctionToolkit"),
+    "UnityCatalogTool": ("unitycatalog.ai.langchain.toolkit", "UnityCatalogTool"),
+}
+
+
+def __getattr__(name: str) -> Any:
+    """Load public integrations only when callers request them."""
+    target = _EXPORTS.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name, attribute = target
+    value = getattr(import_module(module_name), attribute)
+    globals()[name] = value
+    return value
+
 
 # Expose all integrations to users under databricks-langchain
 __all__ = [
