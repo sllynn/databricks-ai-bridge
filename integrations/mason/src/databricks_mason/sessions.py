@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import pathlib
 from typing import Any, Optional
 
 import click
@@ -37,6 +38,95 @@ def items() -> None:
     """Transcript items within a session."""
 
 
+# --- bind a store to an agent project (agent.toml) --------------------------
+
+
+def _source_option(function):
+    return click.option(
+        "--source",
+        type=click.Path(exists=True, file_okay=False, path_type=pathlib.Path),
+        default=pathlib.Path("."),
+        show_default=True,
+        help="Mason agent project containing agent.toml.",
+    )(function)
+
+
+@sessions.command("bind")
+@click.argument("store")
+@_source_option
+@click.option(
+    "--no-create-stores",
+    is_flag=True,
+    help="Require the store to already exist. By default a missing store is created (idempotent).",
+)
+@click.pass_obj
+def sessions_bind(obj, store: str, source: pathlib.Path, no_create_stores: bool) -> None:
+    """Bind session STORE to the agent, declaring it in agent.toml (creating it if it doesn't exist).
+
+    The agent reads the store from agent.toml at runtime; `mason deploy` grants the deployed app's
+    service principal access to it. Pass --no-create-stores to require the store to already exist.
+    """
+    from databricks_mason.agent_project import AgentProject
+    from databricks_mason.deploy import _ensure_session_store
+
+    client = obj.client()
+    if no_create_stores:
+        try:
+            with render.status(f"Resolving session store '{store}'…"):
+                client.get_session_store(store)
+        except AgentCliError as exc:
+            raise AgentCliError(
+                f"Session store '{store}' does not exist (drop --no-create-stores to create it).",
+                error_code=exc.error_code,
+            ) from exc
+        created = False
+    else:
+        with render.status(f"Provisioning session store '{store}'…"):
+            _, created = _ensure_session_store(client, store)
+
+    project = AgentProject.load(source)
+    project.bind_session_store(store)
+    project.write()
+    if obj.output == "json":
+        render.emit_json(
+            {"session_store": store, "created": created, "manifest": str(project.path)}
+        )
+        return
+    # Say whether the store was newly created or an existing one was reused.
+    title = (
+        f"Created and bound session store '{store}'"
+        if created
+        else f"Bound session store '{store}'"
+    )
+    render.success(
+        title,
+        fields={"agent.toml": str(project.path)},
+        next_steps=[
+            ("mason dev", "Re-run to pick up the store locally"),
+            ("mason deploy <name>", "Redeploy to grant the app access"),
+        ],
+    )
+
+
+@sessions.command("unbind")
+@_source_option
+@click.pass_obj
+def sessions_unbind(obj, source: pathlib.Path) -> None:
+    """Remove the session store binding from the agent's agent.toml.
+
+    Only edits agent.toml; the managed store itself is untouched (delete it with
+    `mason sessions stores delete`).
+    """
+    from databricks_mason.agent_project import AgentProject
+
+    project = AgentProject.load(source)
+    if project.unbind_session_store():
+        project.write()
+        render.success("Removed session store binding", fields={"agent.toml": str(project.path)})
+    else:
+        click.echo(f"No session store binding in {project.path}.")
+
+
 # --- session stores ---------------------------------------------------------
 
 
@@ -57,13 +147,20 @@ def _render_store_detail(store: dict) -> None:
 
 
 @stores.command("create")
-@click.option("--name", "name", required=True, help="Workspace-unique store name (3-63 chars).")
+@click.option(
+    "--name",
+    "--display-name",
+    "name",
+    required=True,
+    help="Workspace-unique store name, 3-63 chars (--display-name is accepted as an alias).",
+)
 @click.option("--description", default=None)
 @click.option("--metadata", default=None, help="JSON object of string labels.")
 @click.pass_obj
 def stores_create(obj, name, description, metadata) -> None:
     """Create a session store."""
-    data = obj.client().create_session_store(name, description, _parse_metadata(metadata))
+    with render.status(f"Creating session store '{name}'…"):
+        data = obj.client().create_session_store(name, description, _parse_metadata(metadata))
     if obj.output == "json":
         render.emit_json(data)
         return
@@ -71,8 +168,15 @@ def stores_create(obj, name, description, metadata) -> None:
         f"Created session store '{name}'",
         fields={"Store ID": field(data, "session_store_id")},
         next_steps=[
-            f"mason sessions create --store {name} --actor-id <id>",
-            f"mason sessions stores get {name}",
+            (
+                f"mason sessions create --store {name} --actor-id <id>",
+                "Start a session for an actor",
+            ),
+            (f"mason sessions stores get {name}", "View this store's details"),
+            (
+                f"mason sessions bind {name}",
+                "Bind this store to the agent (wired in on dev/deploy)",
+            ),
         ],
     )
 
@@ -140,9 +244,11 @@ def stores_update(obj, name, description, metadata) -> None:
 
 @stores.command("delete")
 @click.argument("name")
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation prompt.")
 @click.pass_obj
-def stores_delete(obj, name) -> None:
+def stores_delete(obj, name, yes) -> None:
     """Delete a session store."""
+    render.confirm_destroy(f"session store '{name}'", assume_yes=yes)
     obj.client().delete_session_store(name)
     if obj.output == "json":
         render.emit_json({"deleted": name})
@@ -215,8 +321,11 @@ def sessions_create(obj, store, actor_id, session_id, parent_session_id, metadat
         f"Created session '{field(data, 'session_id')}'",
         fields={"Actor": actor_id, "Store": store},
         next_steps=[
-            f"mason sessions items append --store {store} "
-            f"--session-id {field(data, 'session_id')} --data '{{...}}'",
+            (
+                f"mason sessions items append --store {store} "
+                f"--session-id {field(data, 'session_id')} --data '{{...}}'",
+                "Append an item to this session",
+            ),
         ],
     )
 
@@ -261,10 +370,14 @@ def sessions_list(obj, store, filter_, order_by, page_size, page_token) -> None:
 
 @sessions.command("get")
 @click.argument("session_id")
-@click.option("--store", default=None, help="Store name; omit to resolve by session id.")
+@click.option("--store", default=None, help="Session store name (required in this preview).")
 @click.pass_obj
 def sessions_get(obj, session_id, store) -> None:
     """Get a session by id."""
+    if not store:
+        raise AgentCliError(
+            "Provide --store. Resolving a session by id alone is not supported in this preview."
+        )
     data = obj.client().get_session(session_id, store)
     if obj.output == "json":
         render.emit_json(data)
@@ -292,9 +405,11 @@ def sessions_update(obj, session_id, store, metadata) -> None:
 @click.argument("session_id")
 @click.option("--store", required=True)
 @click.option("--force", is_flag=True, help="Cascade-delete descendant sessions.")
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation prompt.")
 @click.pass_obj
-def sessions_delete(obj, session_id, store, force) -> None:
+def sessions_delete(obj, session_id, store, force, yes) -> None:
     """Delete a session."""
+    render.confirm_destroy(f"session '{session_id}'", assume_yes=yes)
     obj.client().delete_session(store, session_id, force)
     if obj.output == "json":
         render.emit_json({"deleted": session_id})
@@ -303,17 +418,39 @@ def sessions_delete(obj, session_id, store, force) -> None:
 
 
 @sessions.command("fork")
+@click.argument("source_session_id_arg", required=False, metavar="[SOURCE_SESSION_ID]")
 @click.option("--store", required=True)
-@click.option("--source-session-id", required=True)
+@click.option(
+    "--source-session-id",
+    "source_session_id_opt",
+    default=None,
+    help="Source session to fork (or pass it as the positional argument).",
+)
 @click.option("--actor-id", required=True)
 @click.option("--up-to-item-id", default=None, help="Copy through this item id inclusively.")
 @click.option("--session-id", default=None, help="Optional id for the fork.")
 @click.option("--metadata", default=None)
 @click.pass_obj
 def sessions_fork(
-    obj, store, source_session_id, actor_id, up_to_item_id, session_id, metadata
+    obj,
+    source_session_id_arg,
+    store,
+    source_session_id_opt,
+    actor_id,
+    up_to_item_id,
+    session_id,
+    metadata,
 ) -> None:
     """Fork a session into a new independent top-level session."""
+    source_session_id = source_session_id_arg or source_session_id_opt
+    if not source_session_id:
+        raise AgentCliError(
+            "Provide the source session id (as the positional argument or --source-session-id)."
+        )
+    if source_session_id_arg and source_session_id_opt:
+        raise AgentCliError(
+            "Pass the source session id once — either positionally or via --source-session-id."
+        )
     data = obj.client().fork_session(
         store, source_session_id, actor_id, up_to_item_id, session_id, _parse_metadata(metadata)
     )
@@ -386,7 +523,16 @@ def items_pop(obj, store, session_id) -> None:
         render.emit_json(data)
         return
     item = field(data, "item")
-    render.success("Popped last item" if item else "Session was already empty")
+    if not item:
+        render.success("Session was already empty")
+        return
+    render.success(
+        "Popped last item",
+        fields={
+            "Item ID": field(item, "item_id"),
+            "Data": _truncate(field(item, "data"), 70),
+        },
+    )
 
 
 @items.command("clear")

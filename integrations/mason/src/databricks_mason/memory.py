@@ -2,14 +2,43 @@
 
 from __future__ import annotations
 
+import pathlib
 from typing import Any
 
 import click
 
 from databricks_mason import render, timefmt
+from databricks_mason.errors import AgentCliError
 from databricks_mason.render import field
 
 _BREADCRUMB = "Agent Memory"
+
+# Friendly aliases for the memory-entry source type, mapped to the API enum values.
+_SOURCE_TYPES = {
+    "agent": "MANAGED_MEMORY_ENTRY_SOURCE_TYPE_AGENT",
+    "unspecified": "MANAGED_MEMORY_ENTRY_SOURCE_TYPE_UNSPECIFIED",
+}
+
+
+def _normalize_source_type(value):
+    """Accept a friendly alias ('agent'/'unspecified') or the full enum; None passes through."""
+    if value is None:
+        return None
+    key = value.strip().lower()
+    if key in _SOURCE_TYPES:
+        return _SOURCE_TYPES[key]
+    if value in _SOURCE_TYPES.values():
+        return value
+    raise AgentCliError(f"Invalid --source-type {value!r}. Choose one of: agent, unspecified.")
+
+
+def _require_entry_store(store, entry) -> None:
+    """A store is needed unless the entry is a full `memory-stores/.../entries/...` name."""
+    if not store and not str(entry).strip().startswith("memory-stores/"):
+        raise AgentCliError(
+            "Provide --store, or pass the full entry resource name "
+            "(memory-stores/<store>/entries/<id>)."
+        )
 
 
 def _store_id(store: dict) -> str:
@@ -40,6 +69,91 @@ def entries() -> None:
     """Memory entries within a store, partitioned by actor."""
 
 
+# --- bind a store to an agent project (agent.toml) --------------------------
+
+
+def _source_option(function):
+    return click.option(
+        "--source",
+        type=click.Path(exists=True, file_okay=False, path_type=pathlib.Path),
+        default=pathlib.Path("."),
+        show_default=True,
+        help="Mason agent project containing agent.toml.",
+    )(function)
+
+
+@memory.command("bind")
+@click.argument("store")
+@_source_option
+@click.option(
+    "--no-create-stores",
+    is_flag=True,
+    help="Require the store to already exist. By default a missing store is created (idempotent).",
+)
+@click.pass_obj
+def memory_bind(obj, store: str, source: pathlib.Path, no_create_stores: bool) -> None:
+    """Bind memory STORE to the agent, declaring it in agent.toml (creating it if it doesn't exist).
+
+    The agent reads the store from agent.toml at runtime; `mason deploy` grants the deployed app's
+    service principal access to it. Pass --no-create-stores to require the store to already exist.
+    """
+    from databricks_mason.agent_project import AgentProject
+    from databricks_mason.deploy import _ensure_memory_store, _resolve_memory_store
+
+    client = obj.client()
+    if no_create_stores:
+        with render.status(f"Resolving memory store '{store}'…"):
+            resolved = _resolve_memory_store(client, store)
+        if resolved is None:
+            raise AgentCliError(
+                f"Memory store '{store}' does not exist (drop --no-create-stores to create it)."
+            )
+        created = False
+    else:
+        with render.status(f"Provisioning memory store '{store}'…"):
+            resolved, created = _ensure_memory_store(client, store)
+
+    # Record the bare store id: the runtime needs it (not the display name) for the entries API.
+    store_id = (field(resolved, "name") or "").split("/", 1)[-1] or None
+    project = AgentProject.load(source)
+    project.bind_memory_store(store, store_id)
+    project.write()
+    if obj.output == "json":
+        render.emit_json({"memory_store": store, "created": created, "manifest": str(project.path)})
+        return
+    # Say whether the store was newly created or an existing one was reused.
+    title = (
+        f"Created and bound memory store '{store}'" if created else f"Bound memory store '{store}'"
+    )
+    render.success(
+        title,
+        fields={"agent.toml": str(project.path)},
+        next_steps=[
+            ("mason dev", "Re-run to pick up the store locally"),
+            ("mason deploy <name>", "Redeploy to grant the app access"),
+        ],
+    )
+
+
+@memory.command("unbind")
+@_source_option
+@click.pass_obj
+def memory_unbind(obj, source: pathlib.Path) -> None:
+    """Remove the memory store binding from the agent's agent.toml.
+
+    Only edits agent.toml; the managed store itself is untouched (delete it with
+    `mason memory stores delete`).
+    """
+    from databricks_mason.agent_project import AgentProject
+
+    project = AgentProject.load(source)
+    if project.unbind_memory_store():
+        project.write()
+        render.success("Removed memory store binding", fields={"agent.toml": str(project.path)})
+    else:
+        click.echo(f"No memory store binding in {project.path}.")
+
+
 # --- stores -----------------------------------------------------------------
 
 
@@ -68,6 +182,16 @@ mason memory entries search --store {store_id} --actor-id alice --query "style"
     ]
 
 
+def _store_created(store: dict):
+    # The API returns RFC 3339 `create_time`; older responses used epoch-millis
+    # `created_at`. Read the current field, falling back to the legacy one.
+    return field(store, "create_time") or field(store, "created_at")
+
+
+def _store_updated(store: dict):
+    return field(store, "update_time") or field(store, "updated_at")
+
+
 def _render_store_detail(obj, store: dict) -> None:
     render.detail(
         _BREADCRUMB,
@@ -79,8 +203,8 @@ def _render_store_detail(obj, store: dict) -> None:
             "Owner": field(store, "owner_user_id"),
             "Storage": render.field(field(store, "storage_backend") or {}, "backend_id"),
             "Description": field(store, "description"),
-            "Created": timefmt.absolute(field(store, "created_at")),
-            "Updated": timefmt.absolute(field(store, "updated_at")),
+            "Created": timefmt.absolute(_store_created(store)),
+            "Updated": timefmt.absolute(_store_updated(store)),
         },
         status="ACTIVE",
         snippets=_store_starter_code(obj, store),
@@ -88,12 +212,19 @@ def _render_store_detail(obj, store: dict) -> None:
 
 
 @stores.command("create")
-@click.option("--display-name", required=True, help="Workspace-unique display name.")
-@click.option("--description", default=None)
+@click.option(
+    "--display-name",
+    "--name",
+    "display_name",
+    required=True,
+    help="Workspace-unique display name (--name is accepted as an alias).",
+)
+@click.option("--description", default=None, help="Optional human-readable description.")
 @click.pass_obj
 def stores_create(obj, display_name, description) -> None:
     """Create a memory store."""
-    data = obj.client().create_memory_store(display_name, description)
+    with render.status(f"Creating memory store '{display_name}'…"):
+        data = obj.client().create_memory_store(display_name, description)
     if obj.output == "json":
         render.emit_json(data)
         return
@@ -102,8 +233,15 @@ def stores_create(obj, display_name, description) -> None:
         f"Created memory store '{display_name}'",
         fields={"Store ID": store_id, "Name": field(data, "name")},
         next_steps=[
-            f"mason memory entries create --store {store_id} --actor-id <id> --path </p>",
-            f"mason memory stores get {store_id}",
+            (
+                f"mason memory entries create --store {store_id} --actor-id <id> --path </p>",
+                "Add a memory entry for an actor",
+            ),
+            (f"mason memory stores get {store_id}", "View this store's details"),
+            (
+                f"mason memory bind {display_name}",
+                "Bind this store to the agent (wired in on dev/deploy)",
+            ),
         ],
     )
 
@@ -123,8 +261,8 @@ def stores_list(obj, page_size, page_token) -> None:
         [
             field(s, "display_name"),
             _store_id(s),
-            timefmt.relative(field(s, "created_at")),
-            timefmt.relative(field(s, "updated_at")),
+            timefmt.relative(_store_created(s)),
+            timefmt.relative(_store_updated(s)),
             _truncate(field(s, "description"), 40),
         ]
         for s in items
@@ -171,9 +309,11 @@ def stores_update(obj, name, display_name, description) -> None:
 
 @stores.command("delete")
 @click.argument("name")
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation prompt.")
 @click.pass_obj
-def stores_delete(obj, name) -> None:
+def stores_delete(obj, name, yes) -> None:
     """Delete (soft-delete) a memory store."""
+    render.confirm_destroy(f"memory store '{name}'", assume_yes=yes)
     obj.client().delete_memory_store(name)
     if obj.output == "json":
         render.emit_json({"deleted": name})
@@ -205,25 +345,36 @@ def _render_entry_detail(entry: dict) -> None:
 
 @entries.command("create")
 @click.option("--store", required=True, help="Store id or resource name.")
-@click.option("--actor-id", required=True)
+@click.option("--actor-id", required=True, help="Actor (partition) this entry belongs to.")
 @click.option("--path", required=True, help="Absolute path, e.g. /preferences/style.md.")
-@click.option("--content", default=None)
-@click.option("--description", default=None)
-@click.option("--session-id", default=None)
+@click.option(
+    "--content", default=None, help="Entry content (inline). Use --content-file for large content."
+)
+@click.option(
+    "--content-file",
+    "content_file",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="Read entry content from a file (avoids shell arg-length limits on large content).",
+)
+@click.option("--description", default=None, help="Optional human-readable description.")
+@click.option("--session-id", default=None, help="Optional session id to associate the entry with.")
 @click.option(
     "--source-type",
     default=None,
-    type=click.Choice(
-        ["MANAGED_MEMORY_ENTRY_SOURCE_TYPE_AGENT", "MANAGED_MEMORY_ENTRY_SOURCE_TYPE_UNSPECIFIED"]
-    ),
+    help="Origin of the entry: 'agent' or 'unspecified'.",
 )
 @click.pass_obj
 def entries_create(
-    obj, store, actor_id, path, content, description, session_id, source_type
+    obj, store, actor_id, path, content, content_file, description, session_id, source_type
 ) -> None:
     """Create a memory entry."""
+    if content is not None and content_file is not None:
+        raise AgentCliError("Pass either --content or --content-file, not both.")
+    if content_file is not None:
+        content = pathlib.Path(content_file).read_text()
     data = obj.client().create_memory_entry(
-        store, actor_id, path, content, description, session_id, source_type
+        store, actor_id, path, content, description, session_id, _normalize_source_type(source_type)
     )
     if obj.output == "json":
         render.emit_json(data)
@@ -232,11 +383,14 @@ def entries_create(
 
 
 @entries.command("get")
-@click.option("--store", required=True)
+@click.option(
+    "--store", default=None, help="Store id/name (optional if ENTRY is a full resource name)."
+)
 @click.argument("entry")
 @click.pass_obj
 def entries_get(obj, store, entry) -> None:
     """Get an entry by id or resource name (includes content)."""
+    _require_entry_store(store, entry)
     data = obj.client().get_memory_entry(store, entry)
     if obj.output == "json":
         render.emit_json(data)
@@ -253,7 +407,7 @@ def entries_get(obj, store, entry) -> None:
 @click.option("--page-token", default=None)
 @click.pass_obj
 def entries_list(obj, store, actor_id, path_prefix, session_id, page_size, page_token) -> None:
-    """List entries for an actor (content omitted)."""
+    """List entries for an actor. The text view omits content; `-o json` includes it."""
     data = obj.client().list_memory_entries(
         store, actor_id, path_prefix, session_id, page_size, page_token
     )
@@ -289,15 +443,25 @@ def entries_list(obj, store, actor_id, path_prefix, session_id, page_size, page_
 @click.option("--store", required=True)
 @click.option("--actor-id", required=True)
 @click.option("--query", required=True)
-@click.option("--limit", type=int, default=None)
+@click.option("--page-size", type=int, default=None)
 @click.pass_obj
-def entries_search(obj, store, actor_id, query, limit) -> None:
+def entries_search(obj, store, actor_id, query, page_size) -> None:
     """Full-text search an actor's entries, ranked (includes content)."""
-    data = obj.client().search_memory_entries(store, actor_id, query, limit)
+    data = obj.client().search_memory_entries(
+        store,
+        actor_id,
+        query,
+        page_size=page_size,
+    )
     if obj.output == "json":
         render.emit_json(data)
         return
-    items = field(data, "managed_memory_entries") or []
+    results = field(data, "results")
+    items = (
+        [field(result, "managed_memory_entry") for result in results]
+        if results is not None
+        else field(data, "managed_memory_entries") or []
+    )
     rows = [
         [
             field(e, "path"),
@@ -315,13 +479,16 @@ def entries_search(obj, store, actor_id, query, limit) -> None:
 
 
 @entries.command("update")
-@click.option("--store", required=True)
+@click.option(
+    "--store", default=None, help="Store id/name (optional if ENTRY is a full resource name)."
+)
 @click.argument("entry")
-@click.option("--content", default=None)
-@click.option("--description", default=None)
+@click.option("--content", default=None, help="New entry content.")
+@click.option("--description", default=None, help="New description.")
 @click.pass_obj
 def entries_update(obj, store, entry, content, description) -> None:
     """Update an entry's content and/or description."""
+    _require_entry_store(store, entry)
     data = obj.client().update_memory_entry(store, entry, content, description)
     if obj.output == "json":
         render.emit_json(data)
@@ -330,11 +497,16 @@ def entries_update(obj, store, entry, content, description) -> None:
 
 
 @entries.command("delete")
-@click.option("--store", required=True)
+@click.option(
+    "--store", default=None, help="Store id/name (optional if ENTRY is a full resource name)."
+)
 @click.argument("entry")
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation prompt.")
 @click.pass_obj
-def entries_delete(obj, store, entry) -> None:
+def entries_delete(obj, store, entry, yes) -> None:
     """Delete a memory entry."""
+    _require_entry_store(store, entry)
+    render.confirm_destroy(f"memory entry '{entry}'", assume_yes=yes)
     obj.client().delete_memory_entry(store, entry)
     if obj.output == "json":
         render.emit_json({"deleted": entry})
