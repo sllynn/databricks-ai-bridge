@@ -14,7 +14,7 @@ dependencies = [
     "databricks-ai-bridge>=0.20.0",
     "mlflow>=3.0.0",
     "pydantic>2.10.0",
-    "unitycatalog-langchain[databricks]>=0.3.0",
+    "unitycatalog-langchain>=0.3.0",
     "databricks-sdk>=0.65.0",
     "openai>=1.99.9",
     "databricks-openai>=0.14.0",
@@ -23,6 +23,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+unitycatalog-databricks = [
+  "unitycatalog-langchain[databricks]>=0.3.0",
+]
 memory = [
   "langgraph-checkpoint-postgres>=2.0.5",
   "databricks-ai-bridge[memory]>=0.17.0",
